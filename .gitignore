@@ -1,0 +1,33 @@
+# Dataset
+dataset/
+
+# Training outputs
+runs/
+
+# Test images
+test_images/
+
+# Generated inference outputs
+outputs/
+
+# Model weights
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+Thumbs.db
+.DS_Store
