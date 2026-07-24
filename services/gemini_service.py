@@ -124,15 +124,15 @@ class GeminiService:
 
                 raise
 
-            except ServerError:
+            except ServerError as e:
 
-                wait = 2 ** attempt
+                wait = min(5 * (attempt + 1), 30)
 
                 print(
-                    f"Gemini Busy "
-                    f"(Retry {attempt+1}/{max_attempts}) "
-                    f"Waiting {wait}s..."
-                )
+        f"Gemini Server Busy (503)"
+        f"\nRetry {attempt + 1}/{max_attempts}"
+        f"\nWaiting {wait} seconds..."
+    )
 
                 time.sleep(wait)
 
