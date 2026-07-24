@@ -18,7 +18,7 @@ AI Explanation
     ↓
 Final JSON
 
-Author : Jasmeen
+Author : Manjeet
 =========================================================
 """
 
@@ -40,7 +40,7 @@ class PCBInspectionPipeline:
     # Inspect PCB
     # =====================================================
 
-    def inspect(self, image_path):
+    def inspect(self, image_path, confidence=0.50, iou=0.40):
 
         start_time = time.time()
 
@@ -48,19 +48,20 @@ class PCBInspectionPipeline:
         # YOLO Detection
         # -------------------------------------------------
 
-        detections = self.detector.predict(image_path)
+        detections = self.detector.predict(
+            image_path,
+            confidence=confidence,
+            iou=iou,
+        )
 
         # -------------------------------------------------
         # AI Explanation
         # -------------------------------------------------
 
         explanations = self.engine.generate(
-
             image_path=image_path,
-
-            detections=detections
-
-        )
+            detections=detections,
+        ) if detections else []
 
         result = {
 
@@ -85,11 +86,8 @@ class PCBInspectionPipeline:
         print("=" * 60)
 
         print(
-
             f"Pipeline completed in "
-
             f"{result['pipeline_time_sec']} sec"
-
         )
 
         print("=" * 60)
