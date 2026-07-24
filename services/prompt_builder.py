@@ -14,7 +14,7 @@ Output
 ------
 Prompt String
 
-Author : Jasmeen
+Author : Manjeet
 =========================================================
 """
 
@@ -85,6 +85,9 @@ Rules
 4. Do not explain outside JSON.
 5. The number of JSON objects MUST equal the number of images.
 6. Keep explanations concise.
+7. The "severity" field MUST be exactly one of these four strings,
+   spelled and capitalized exactly as shown: "Critical", "High",
+   "Medium", "Low". Do not use any other word, synonym, or casing.
 """
 
         return prompt

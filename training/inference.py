@@ -15,7 +15,7 @@ Output
 Detection JSON
 Annotated Image (Optional)
 
-Author : Jasmeen
+Author : Manjeet
 =========================================================
 """
 
@@ -24,20 +24,22 @@ from pathlib import Path
 import cv2
 from ultralytics import YOLO
 
+# =========================================================
+# Single source of truth for the model path.
+# app.py imports DEFAULT_MODEL_PATH from here instead of
+# hardcoding its own copy, so the two can never drift apart.
+# =========================================================
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
+DEFAULT_MODEL_PATH = ROOT_DIR / "runs" / "pcb_detector-3" / "weights" / "best.pt"
+
 
 class PCBDetector:
 
-    def __init__(self):
+    def __init__(self, model_path=None):
 
-        root = Path(__file__).resolve().parent.parent
-
-        self.model_path = (
-            root /
-            "runs" /
-            "pcb_detector-3" /
-            "weights" /
-            "best.pt"
-        )
+        self.model_path = Path(model_path) if model_path else DEFAULT_MODEL_PATH
 
         if not self.model_path.exists():
             raise FileNotFoundError(
