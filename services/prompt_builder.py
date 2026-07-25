@@ -14,7 +14,7 @@ Output
 ------
 Prompt String
 
-Author : Manjeet
+Author : Jasmeen
 =========================================================
 """
 

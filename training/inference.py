@@ -15,7 +15,7 @@ Output
 Detection JSON
 Annotated Image (Optional)
 
-Author : Manjeet
+Author : Jasmeen
 =========================================================
 """
 
@@ -53,9 +53,27 @@ class PCBDetector:
         image_path,
         confidence=0.50,
         iou=0.40,
+        imgsz=1280,
+        augment=False,
         save_image=False,
-        output_dir=None
+        output_dir=None,
     ):
+        """
+        imgsz
+            Inference resolution. PCB defects (mouse bites, spurs,
+            pin-holes) are tiny relative to the full board, so running
+            inference at a higher resolution than the model was trained
+            at (commonly 640) generally improves recall on small defects
+            without any retraining. 1280 is a solid default; push to
+            1536+ for very high-resolution boards.
+
+        augment
+            Enables Ultralytics' built-in test-time augmentation
+            (multi-scale + flips, results merged via NMS). Improves
+            recall and confidence calibration at the cost of ~2-3x
+            inference time. Good for a "thorough scan" mode, not
+            necessary for quick checks.
+        """
 
         image_path = Path(image_path)
 
@@ -63,6 +81,8 @@ class PCBDetector:
             source=str(image_path),
             conf=confidence,
             iou=iou,
+            imgsz=imgsz,
+            augment=augment,
             save=False,
             verbose=False,
         )

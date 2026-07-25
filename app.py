@@ -29,6 +29,7 @@ import cv2
 import streamlit as st
 
 from services.pipeline import PCBInspectionPipeline
+from services.crop_defects import enhance_clarity
 from training.inference import DEFAULT_MODEL_PATH
 
 try:
@@ -53,11 +54,11 @@ APP_TAGLINE = "AI-assisted visual inspection for printed circuit boards"
 SEVERITY_ORDER = ["Critical", "High", "Medium", "Low"]
 
 SEVERITY_STYLE = {
-    "Critical": {"color": "#c0392b", "bg": "#c0392b", "icon": "⛔"},
-    "High":     {"color": "#d9822b", "bg": "#d9822b", "icon": "🔶"},
-    "Medium":   {"color": "#b8960c", "bg": "#b8960c", "icon": "🟡"},
-    "Low":      {"color": "#2e8b57", "bg": "#2e8b57", "icon": "🟢"},
-    "Unknown":  {"color": "#7f8c8d", "bg": "#7f8c8d", "icon": "⚪"},
+    "Critical": {"bg": "#c0392b", "icon": "⛔"},
+    "High":     {"bg": "#d9822b", "icon": "🔶"},
+    "Medium":   {"bg": "#b8960c", "icon": "🟡"},
+    "Low":      {"bg": "#2ecc71", "icon": "🟢"},
+    "Unknown":  {"bg": "#7f8c8d", "icon": "⚪"},
 }
 
 SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
@@ -67,8 +68,14 @@ BOX_COLOR_BGR = {
     "Critical": (30, 30, 192),
     "High": (30, 130, 217),
     "Medium": (12, 150, 184),
-    "Low": (87, 139, 46),
+    "Low": (87, 190, 60),
     "Unknown": (150, 150, 150),
+}
+
+# Detection modes: (imgsz, augment/TTA, description)
+DETECTION_MODES = {
+    "Balanced": {"imgsz": 1280, "augment": False},
+    "Thorough (slower, higher recall)": {"imgsz": 1536, "augment": True},
 }
 
 # Synonyms the model might drift into despite the prompt's constraint —
@@ -100,14 +107,21 @@ def inject_css():
     st.markdown(
         """
         <style>
+        .pcb-header-wrap {
+            padding-bottom: 10px;
+            border-bottom: 1px solid #22303c;
+            margin-bottom: 20px;
+        }
         .pcb-header-title {
             font-size: 2rem;
-            font-weight: 700;
-            margin-bottom: 0;
+            font-weight: 750;
             line-height: 1.2;
+            background: linear-gradient(90deg, #3fa7ff, #7ee8e0);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
         .pcb-header-tagline {
-            color: #8a8f98;
+            color: #8a95a1;
             font-size: 1rem;
             margin-top: 2px;
         }
@@ -135,7 +149,7 @@ def inject_css():
             opacity: 0.92;
         }
         .pcb-footer {
-            color: #8a8f98;
+            color: #8a95a1;
             font-size: 0.82rem;
             text-align: center;
             margin-top: 2.5rem;
@@ -212,16 +226,23 @@ def normalize_result(result: dict) -> dict:
 # =========================================================
 
 @st.cache_data(show_spinner=False, max_entries=100)
-def run_inspection_cached(_pipeline, image_bytes: bytes, dest_name: str, confidence: float, iou: float):
+def run_inspection_cached(
+    _pipeline, image_bytes: bytes, dest_name: str,
+    confidence: float, iou: float, imgsz: int, augment: bool,
+):
     dest = SESSION_DIR / dest_name
     dest.write_bytes(image_bytes)
-    result = _pipeline.inspect(dest, confidence=confidence, iou=iou)
+    result = _pipeline.inspect(
+        dest, confidence=confidence, iou=iou, imgsz=imgsz, augment=augment,
+    )
     return normalize_result(result)
 
 
 # =========================================================
 # Image helpers — image is read from disk once per file,
-# not once per defect card.
+# not once per defect card. Thumbnails go through the same
+# clarity enhancement the backend uses on Gemini's crops, so
+# what the user sees matches what the model actually analyzed.
 # =========================================================
 
 def load_image_bgr(image_path: Path):
@@ -246,13 +267,14 @@ def draw_boxes(img_bgr, detections: list):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def crop_thumbnail(img_bgr, bbox: dict, padding: int = 12):
+def crop_thumbnail(img_bgr, bbox: dict, padding: int = 15):
     h, w = img_bgr.shape[:2]
     x1 = max(0, int(bbox["x1"]) - padding)
     y1 = max(0, int(bbox["y1"]) - padding)
     x2 = min(w, int(bbox["x2"]) + padding)
     y2 = min(h, int(bbox["y2"]) + padding)
     crop = img_bgr[y1:y2, x1:x2]
+    crop = enhance_clarity(crop)
     return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
 
 
@@ -289,12 +311,17 @@ def sorted_by_severity(detections: list) -> list:
 
 def build_markdown_report(result: dict) -> str:
     label, _, message = overall_verdict(result["detections"])
+    settings = result.get("scan_settings", {})
+
     lines = [
         f"# PCB Inspection Report — {result['image']}",
         "",
         f"**Verdict:** {label} — {message}",
         f"**Total defects:** {result['total_defects']}",
         f"**Processing time:** {result.get('pipeline_time_sec', '—')}s",
+        f"**Scan settings:** {settings.get('imgsz', '—')}px"
+        + (" · thorough (multi-view)" if settings.get("augment") else " · balanced")
+        + f" · confidence ≥ {settings.get('confidence', '—')} · IoU {settings.get('iou', '—')}",
         "",
     ]
 
@@ -352,6 +379,7 @@ def render_single_result(image_path: Path, result: dict, key_suffix: str):
     detections = sorted_by_severity(result.get("detections", []))
     total = result.get("total_defects", 0)
     elapsed = result.get("pipeline_time_sec", None)
+    settings = result.get("scan_settings", {})
     img_bgr = load_image_bgr(image_path)
 
     verdict_label, verdict_color, verdict_msg = overall_verdict(detections)
@@ -369,6 +397,9 @@ def render_single_result(image_path: Path, result: dict, key_suffix: str):
             st.image(draw_boxes(img_bgr, detections), use_container_width=True)
         else:
             st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
+        if settings:
+            mode_note = "thorough (multi-view)" if settings.get("augment") else "balanced"
+            st.caption(f"Scanned at {settings.get('imgsz')}px · {mode_note}")
 
     with right:
         st.markdown("**Summary**")
@@ -446,18 +477,40 @@ def dedupe_labels(names: list) -> list:
 def main():
     inject_css()
 
-    st.markdown(f"<div class='pcb-header-title'>🛠️ {APP_TITLE}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='pcb-header-tagline'>{APP_TAGLINE}</div>", unsafe_allow_html=True)
-    st.write("")
+    st.markdown(
+        f"<div class='pcb-header-wrap'>"
+        f"<div class='pcb-header-title'>🛠️ {APP_TITLE}</div>"
+        f"<div class='pcb-header-tagline'>{APP_TAGLINE}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     problems = check_environment()
     if problems:
-        st.error("**Setup incomplete** — fix the following before continuing:\n\n" + "\n\n".join(f"- {p}" for p in problems))
+        st.error(
+            "**Setup incomplete** — fix the following before continuing:\n\n"
+            + "\n\n".join(f"- {p}" for p in problems)
+        )
         return
 
     pipeline = load_pipeline()
 
     with st.sidebar:
+        st.markdown("### Detection mode")
+        mode = st.radio(
+            "Scan thoroughness",
+            list(DETECTION_MODES.keys()),
+            help=(
+                "Balanced: fast, higher-resolution scan than the model's "
+                "training size — good default. Thorough: adds multi-view "
+                "test-time augmentation for maximum recall on faint or "
+                "small defects, at roughly 2-3x the processing time."
+            ),
+            label_visibility="collapsed",
+        )
+        mode_settings = DETECTION_MODES[mode]
+
+        st.divider()
         st.markdown("### Inspection settings")
         confidence = st.slider(
             "Confidence threshold", 0.05, 0.95, 0.50, 0.05,
@@ -512,7 +565,11 @@ def main():
         image_bytes = uploaded_file.getvalue()
 
         try:
-            result = run_inspection_cached(pipeline, image_bytes, dest_name, confidence, iou)
+            result = run_inspection_cached(
+                pipeline, image_bytes, dest_name,
+                confidence, iou,
+                mode_settings["imgsz"], mode_settings["augment"],
+            )
         except Exception as e:
             st.error(f"Failed to process **{label}**: {e}")
             continue

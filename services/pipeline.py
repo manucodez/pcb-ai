@@ -40,7 +40,7 @@ class PCBInspectionPipeline:
     # Inspect PCB
     # =====================================================
 
-    def inspect(self, image_path, confidence=0.50, iou=0.40):
+    def inspect(self, image_path, confidence=0.50, iou=0.40, imgsz=1280, augment=False):
 
         start_time = time.time()
 
@@ -52,6 +52,8 @@ class PCBInspectionPipeline:
             image_path,
             confidence=confidence,
             iou=iou,
+            imgsz=imgsz,
+            augment=augment,
         )
 
         # -------------------------------------------------
@@ -70,6 +72,15 @@ class PCBInspectionPipeline:
             "total_defects": len(explanations),
 
             "detections": explanations,
+
+            "scan_settings": {
+
+                "confidence": confidence,
+                "iou": iou,
+                "imgsz": imgsz,
+                "augment": augment,
+
+            },
 
             "pipeline_time_sec": round(
 
