@@ -2,7 +2,7 @@
 dataset/
 
 # Training outputs
-
+runs/
 
 # Test images
 test_images/
@@ -11,7 +11,8 @@ test_images/
 outputs/
 
 # Model weights
-
+models/*.pt
+!models/MANIFEST.json
 
 # Python
 __pycache__/

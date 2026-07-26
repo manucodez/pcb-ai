@@ -1,0 +1,21 @@
+## Core app
+streamlit>=1.38
+
+## Detection
+ultralytics>=8.3.40
+torch>=2.2
+opencv-python-headless>=4.9
+
+## AI explanations
+google-genai>=1.0.0
+pillow>=10.0
+
+## Dataset tooling
+pyyaml>=6.0
+numpy>=1.26
+
+## Config
+python-dotenv>=1.0
+
+## Dev / testing (not required to run the app)
+pytest>=8.0

@@ -22,15 +22,24 @@ import os
 import shutil
 import tempfile
 import uuid
-from collections import Counter, defaultdict
 from pathlib import Path
 
 import cv2
+import numpy as np
 import streamlit as st
 
 from services.pipeline import PCBInspectionPipeline
 from services.crop_defects import enhance_clarity
-from training.inference import DEFAULT_MODEL_PATH
+from services.image_quality import assess_quality
+from services.report_utils import (
+    SEVERITY_ORDER,
+    normalize_result,
+    overall_verdict,
+    sorted_by_severity,
+    dedupe_labels,
+    build_markdown_report,
+)
+from training.inference import DEFAULT_MODEL_PATH, MODELS_DIR, RUNS_DIR
 
 try:
     from dotenv import load_dotenv
@@ -51,8 +60,6 @@ st.set_page_config(
 APP_TITLE = "PCB Defect Inspector"
 APP_TAGLINE = "AI-assisted visual inspection for printed circuit boards"
 
-SEVERITY_ORDER = ["Critical", "High", "Medium", "Low"]
-
 SEVERITY_STYLE = {
     "Critical": {"bg": "#c0392b", "icon": "⛔"},
     "High":     {"bg": "#d9822b", "icon": "🔶"},
@@ -60,9 +67,6 @@ SEVERITY_STYLE = {
     "Low":      {"bg": "#2ecc71", "icon": "🟢"},
     "Unknown":  {"bg": "#7f8c8d", "icon": "⚪"},
 }
-
-SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
-SEVERITY_RANK["Unknown"] = len(SEVERITY_ORDER)
 
 BOX_COLOR_BGR = {
     "Critical": (30, 30, 192),
@@ -72,20 +76,24 @@ BOX_COLOR_BGR = {
     "Unknown": (150, 150, 150),
 }
 
-# Detection modes: (imgsz, augment/TTA, description)
+# Detection modes: (imgsz, augment/TTA, tiled sliding-window scan, description)
 DETECTION_MODES = {
-    "Balanced": {"imgsz": 1280, "augment": False},
-    "Thorough (slower, higher recall)": {"imgsz": 1536, "augment": True},
+    "Balanced": {"imgsz": 1280, "augment": False, "tiled": False},
+    "Thorough (slower, higher recall)": {"imgsz": 1536, "augment": True, "tiled": False},
+    "Maximum recall — tiled scan (slowest)": {"imgsz": 1280, "augment": False, "tiled": True},
 }
 
-# Synonyms the model might drift into despite the prompt's constraint —
-# normalized defensively so the UI never silently breaks on an unexpected string.
-_SEVERITY_SYNONYMS = {
-    "critical": "Critical", "severe": "Critical", "blocker": "Critical",
-    "high": "High", "major": "High",
-    "medium": "Medium", "moderate": "Medium",
-    "low": "Low", "minor": "Low", "cosmetic": "Low",
-}
+MODE_HELP = (
+    "Balanced: fast, higher-resolution scan than the model's training "
+    "size — good default.\n\n"
+    "Thorough: adds multi-view test-time augmentation for better recall "
+    "on faint or small defects, at roughly 2-3x the processing time.\n\n"
+    "Maximum recall (tiled scan): splits high-resolution images into "
+    "overlapping tiles and scans each at full detail before merging "
+    "results — the best option for catching tiny defects (mouse bites, "
+    "spurs, pin-holes) on large board photos, at the cost of the "
+    "slowest processing time."
+)
 
 
 # =========================================================
@@ -154,6 +162,11 @@ def inject_css():
             text-align: center;
             margin-top: 2.5rem;
         }
+        .pcb-fallback-note {
+            color: #8a95a1;
+            font-size: 0.8rem;
+            font-style: italic;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -184,9 +197,11 @@ def check_environment() -> list[str]:
 
     if not DEFAULT_MODEL_PATH.exists():
         problems.append(
-            f"Trained model weights not found at `{DEFAULT_MODEL_PATH}`. "
-            "Update `DEFAULT_MODEL_PATH` in `training/inference.py` if your "
-            "training run folder has a different name."
+            f"No trained model found. Checked `{MODELS_DIR / 'best.pt'}` and "
+            f"`{RUNS_DIR}/*/weights/best.pt`. Train one with "
+            "`python training/train_yolo.py` (auto-promotes the result), or "
+            "point the `PCB_MODEL_PATH` environment variable at an existing "
+            "`.pt` file."
         )
 
     return problems
@@ -195,27 +210,6 @@ def check_environment() -> list[str]:
 @st.cache_resource(show_spinner="Loading detection model…")
 def load_pipeline():
     return PCBInspectionPipeline()
-
-
-# =========================================================
-# Severity normalization
-# =========================================================
-
-def normalize_severity(raw) -> str:
-    if not raw:
-        return "Unknown"
-    key = str(raw).strip().lower()
-    if key in ("critical", "high", "medium", "low"):
-        return key.capitalize()
-    return _SEVERITY_SYNONYMS.get(key, "Unknown")
-
-
-def normalize_result(result: dict) -> dict:
-    for det in result.get("detections", []):
-        exp = det.get("explanation") or {}
-        exp["severity"] = normalize_severity(exp.get("severity"))
-        det["explanation"] = exp
-    return result
 
 
 # =========================================================
@@ -228,12 +222,12 @@ def normalize_result(result: dict) -> dict:
 @st.cache_data(show_spinner=False, max_entries=100)
 def run_inspection_cached(
     _pipeline, image_bytes: bytes, dest_name: str,
-    confidence: float, iou: float, imgsz: int, augment: bool,
+    confidence: float, iou: float, imgsz: int, augment: bool, tiled: bool,
 ):
     dest = SESSION_DIR / dest_name
     dest.write_bytes(image_bytes)
     result = _pipeline.inspect(
-        dest, confidence=confidence, iou=iou, imgsz=imgsz, augment=augment,
+        dest, confidence=confidence, iou=iou, imgsz=imgsz, augment=augment, tiled=tiled,
     )
     return normalize_result(result)
 
@@ -279,72 +273,6 @@ def crop_thumbnail(img_bgr, bbox: dict, padding: int = 15):
 
 
 # =========================================================
-# Verdict logic
-# =========================================================
-
-def overall_verdict(detections: list) -> tuple[str, str, str]:
-    """Returns (label, color, message)."""
-    if not detections:
-        return "PASS", "#2e8b57", "No defects detected on this board."
-
-    severities = {d.get("explanation", {}).get("severity", "Unknown") for d in detections}
-
-    if "Critical" in severities:
-        return "FAIL", "#c0392b", "Critical defect(s) found — do not release without rework."
-    if "High" in severities:
-        return "HOLD — REVIEW REQUIRED", "#d9822b", "High-severity defect(s) found — inspect before release."
-    if "Medium" in severities:
-        return "HOLD — REVIEW REQUIRED", "#b8960c", "Medium-severity defect(s) found — recommended rework."
-    return "PASS — MINOR ISSUES", "#2e8b57", "Only low-severity / cosmetic defects found."
-
-
-def sorted_by_severity(detections: list) -> list:
-    return sorted(
-        detections,
-        key=lambda d: SEVERITY_RANK.get(d.get("explanation", {}).get("severity", "Unknown"), 99),
-    )
-
-
-# =========================================================
-# Report builders
-# =========================================================
-
-def build_markdown_report(result: dict) -> str:
-    label, _, message = overall_verdict(result["detections"])
-    settings = result.get("scan_settings", {})
-
-    lines = [
-        f"# PCB Inspection Report — {result['image']}",
-        "",
-        f"**Verdict:** {label} — {message}",
-        f"**Total defects:** {result['total_defects']}",
-        f"**Processing time:** {result.get('pipeline_time_sec', '—')}s",
-        f"**Scan settings:** {settings.get('imgsz', '—')}px"
-        + (" · thorough (multi-view)" if settings.get("augment") else " · balanced")
-        + f" · confidence ≥ {settings.get('confidence', '—')} · IoU {settings.get('iou', '—')}",
-        "",
-    ]
-
-    for det in sorted_by_severity(result["detections"]):
-        exp = det.get("explanation", {})
-        lines += [
-            f"## Defect #{det.get('id', '?')} — {det['class'].replace('_', ' ').title()}",
-            f"- **Severity:** {exp.get('severity', 'N/A')}",
-            f"- **Confidence:** {det['confidence']:.1%}",
-            f"- **What's wrong:** {exp.get('explanation', 'N/A')}",
-            f"- **Likely cause:** {exp.get('root_cause', 'N/A')}",
-            f"- **Recommended fix:** {exp.get('recommended_fix', 'N/A')}",
-            f"- **Prevention:** {exp.get('prevention', 'N/A')}",
-            "",
-        ]
-
-    if not result["detections"]:
-        lines.append("_No defects detected — board passed inspection._")
-
-    return "\n".join(lines)
-
-
-# =========================================================
 # Rendering
 # =========================================================
 
@@ -374,13 +302,23 @@ def render_defect_card(det: dict, img_bgr):
             st.markdown(f"**Recommended fix**  \n{exp.get('recommended_fix', 'N/A')}")
             st.markdown(f"**Prevention**  \n{exp.get('prevention', 'N/A')}")
 
+            if not exp.get("ai_generated", True):
+                st.markdown(
+                    "<span class='pcb-fallback-note'>ℹ️ Standard reference guidance — "
+                    "AI review was unavailable for this specific defect.</span>",
+                    unsafe_allow_html=True,
+                )
 
-def render_single_result(image_path: Path, result: dict, key_suffix: str):
+
+def render_single_result(image_path: Path, result: dict, quality: dict, key_suffix: str):
     detections = sorted_by_severity(result.get("detections", []))
     total = result.get("total_defects", 0)
     elapsed = result.get("pipeline_time_sec", None)
     settings = result.get("scan_settings", {})
     img_bgr = load_image_bgr(image_path)
+
+    for warning in quality.get("warnings", []):
+        st.warning(warning, icon="⚠️")
 
     verdict_label, verdict_color, verdict_msg = overall_verdict(detections)
     st.markdown(
@@ -398,7 +336,12 @@ def render_single_result(image_path: Path, result: dict, key_suffix: str):
         else:
             st.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
         if settings:
-            mode_note = "thorough (multi-view)" if settings.get("augment") else "balanced"
+            if settings.get("tiled"):
+                mode_note = "maximum recall (tiled scan)"
+            elif settings.get("augment"):
+                mode_note = "thorough (multi-view)"
+            else:
+                mode_note = "balanced"
             st.caption(f"Scanned at {settings.get('imgsz')}px · {mode_note}")
 
     with right:
@@ -458,18 +401,6 @@ def render_single_result(image_path: Path, result: dict, key_suffix: str):
             st.code(json.dumps(result, indent=2), language="json")
 
 
-def dedupe_labels(names: list) -> list:
-    """Turns repeated filenames into unique, still-readable labels
-    (e.g. two uploads named board.jpg -> 'board.jpg' and 'board.jpg (2)')."""
-    counts = Counter(names)
-    seen = defaultdict(int)
-    labels = []
-    for name in names:
-        seen[name] += 1
-        labels.append(name if counts[name] == 1 else f"{name} ({seen[name]})")
-    return labels
-
-
 # =========================================================
 # Main app
 # =========================================================
@@ -500,12 +431,7 @@ def main():
         mode = st.radio(
             "Scan thoroughness",
             list(DETECTION_MODES.keys()),
-            help=(
-                "Balanced: fast, higher-resolution scan than the model's "
-                "training size — good default. Thorough: adds multi-view "
-                "test-time augmentation for maximum recall on faint or "
-                "small defects, at roughly 2-3x the processing time."
-            ),
+            help=MODE_HELP,
             label_visibility="collapsed",
         )
         mode_settings = DETECTION_MODES[mode]
@@ -531,6 +457,7 @@ def main():
             except Exception:
                 st.caption("Class list unavailable.")
             st.caption("Detection: YOLOv11 · Explanations: Gemini Vision")
+            st.caption(f"Weights: `{pipeline.detector.model_path}`")
 
         st.divider()
         if st.button("Clear session data", use_container_width=True):
@@ -552,7 +479,7 @@ def main():
 
     labels = dedupe_labels([f.name for f in uploaded_files])
 
-    results = []  # list of (label, image_path, result)
+    results = []  # list of (label, image_path, result, quality)
     progress = st.progress(0.0, text="Starting inspection…")
 
     for i, (uploaded_file, label) in enumerate(zip(uploaded_files, labels)):
@@ -564,11 +491,14 @@ def main():
         dest_name = f"{i}_{uploaded_file.name}"
         image_bytes = uploaded_file.getvalue()
 
+        decoded = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        quality = assess_quality(decoded)
+
         try:
             result = run_inspection_cached(
                 pipeline, image_bytes, dest_name,
                 confidence, iou,
-                mode_settings["imgsz"], mode_settings["augment"],
+                mode_settings["imgsz"], mode_settings["augment"], mode_settings["tiled"],
             )
         except Exception as e:
             st.error(f"Failed to process **{label}**: {e}")
@@ -576,7 +506,7 @@ def main():
 
         result = dict(result)
         result["image"] = uploaded_file.name  # keep the human-friendly name for reports
-        results.append((label, SESSION_DIR / dest_name, result))
+        results.append((label, SESSION_DIR / dest_name, result, quality))
 
     progress.progress(1.0, text="Done.")
     progress.empty()
@@ -587,13 +517,13 @@ def main():
     st.divider()
 
     if len(results) == 1:
-        label, image_path, result = results[0]
-        render_single_result(image_path, result, key_suffix="0")
+        label, image_path, result, quality = results[0]
+        render_single_result(image_path, result, quality, key_suffix="0")
     else:
-        tabs = st.tabs([label for label, _, _ in results])
-        for tab, (i, (label, image_path, result)) in zip(tabs, enumerate(results)):
+        tabs = st.tabs([label for label, _, _, _ in results])
+        for tab, (i, (label, image_path, result, quality)) in zip(tabs, enumerate(results)):
             with tab:
-                render_single_result(image_path, result, key_suffix=str(i))
+                render_single_result(image_path, result, quality, key_suffix=str(i))
 
     st.markdown(
         "<div class='pcb-footer'>AI-assisted inspection — verify Critical and High severity "
